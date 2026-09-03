@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Caption to Transcript Converter</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<style>
+  :root {
+    --bg: #f7f7f8;
+    --card-bg: #ffffff;
+    --text: #1f2328;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --accent-hover: #1d4ed8;
+    --border: #d1d5db;
+    --success-bg: #ecfdf5;
+    --success-border: #10b981;
+    --error-bg: #fef2f2;
+    --error-border: #ef4444;
+  }
+  * { box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    margin: 0;
+    padding: 40px 20px;
+    display: flex;
+    justify-content: center;
+  }
+  .card {
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 32px;
+    max-width: 560px;
+    width: 100%;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+  }
+  h1 {
+    font-size: 1.5rem;
+    margin-top: 0;
+    margin-bottom: 8px;
+  }
+  p.subtitle {
+    color: var(--muted);
+    margin-top: 0;
+    margin-bottom: 24px;
+    font-size: 0.95rem;
+  }
+  label {
+    display: block;
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+  input[type="file"] {
+    display: block;
+    width: 100%;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg);
+    margin-bottom: 20px;
+    font-size: 0.95rem;
+  }
+  button {
+    font-size: 1rem;
+    font-weight: 600;
+    padding: 12px 20px;
+    border-radius: 8px;
+    border: none;
+    cursor: pointer;
+    transition: background 0.15s ease;
+  }
+  button[type="submit"] {
+    background: var(--accent);
+    color: #fff;
+    width: 100%;
+  }
+  button[type="submit"]:hover {
+    background: var(--accent-hover);
+  }
+  button[type="submit"]:disabled {
+    background: #93c5fd;
+    cursor: not-allowed;
+  }
+  #resultArea {
+    margin-top: 24px;
+    padding: 18px;
+    border-radius: 8px;
+    background: var(--success-bg);
+    border: 1px solid var(--success-border);
+    display: none;
+  }
+  #resultArea.visible {
+    display: block;
+  }
+  #resultArea .filename {
+    font-weight: 600;
+    margin-bottom: 12px;
+    word-break: break-all;
+  }
+  #downloadBtn {
+    background: var(--success-border);
+    color: #fff;
+  }
+  #downloadBtn:hover {
+    background: #0d9c6b;
+  }
+  #errorArea {
+    margin-top: 20px;
+    padding: 14px 18px;
+    border-radius: 8px;
+    background: var(--error-bg);
+    border: 1px solid var(--error-border);
+    color: #991b1b;
+    display: none;
+    font-size: 0.9rem;
+  }
+  #errorArea.visible {
+    display: block;
+  }
+  .meta {
+    color: var(--muted);
+    font-size: 0.85rem;
+    margin-top: 4px;
+  }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <h1>Timecode scrubber</h1>
+  <p class="subtitle">Upload an SRT or VTT caption file and convert it into a Word document transcript, with timecodes removed.</p>
+
+  <form id="convertForm">
+    <label for="captionFile">Select a caption file</label>
+    <input type="file" id="captionFile" name="captionFile" accept=".srt,.vtt,text/vtt,application/x-subrip" required>
+    <button type="submit" id="submitBtn">Convert to document transcript</button>
+  </form>
+
+  <div id="errorArea"></div>
+
+  <div id="resultArea">
+    <div class="filename" id="resultFilename"></div>
+    <button id="downloadBtn" type="button">Download</button>
+    <div class="meta" id="resultMeta"></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  const form = document.getElementById('convertForm');
+  const fileInput = document.getElementById('captionFile');
+  const submitBtn = document.getElementById('submitBtn');
+  const resultArea = document.getElementById('resultArea');
+  const resultFilename = document.getElementById('resultFilename');
+  const resultMeta = document.getElementById('resultMeta');
+  const downloadBtn = document.getElementById('downloadBtn');
+  const errorArea = document.getElementById('errorArea');
+
+  let currentBlobUrl = null;
+  let currentFilename = null;
+
+  function showError(msg) {
+    errorArea.textContent = msg;
+    errorArea.classList.add('visible');
+    resultArea.classList.remove('visible');
+  }
+
+  function clearError() {
+    errorArea.textContent = '';
+    errorArea.classList.remove('visible');
+  }
+
+  // Parse SRT or VTT text into an array of cue-text strings.
+  // Each cue's (possibly multi-line) text is collapsed into a single line.
+  // Timecode lines, cue index numbers, and VTT headers/NOTE blocks are discarded.
+  function parseCaptions(rawText) {
+    const lines = rawText.replace(/\r/g, '').split('\n');
+    const cues = [];
+    let current = [];
+    let inCue = false;
+
+    function flush() {
+      if (current.length) {
+        const joined = current.join(' ').replace(/\s+/g, ' ').trim();
+        if (joined) cues.push(joined);
+        current = [];
+      }
+    }
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+
+      if (line.includes('-->')) {
+        // A new cue timecode line starts a new cue block.
+        flush();
+        inCue = true;
+        continue;
+      }
+
+      if (inCue) {
+        if (line.trim() === '') {
+          flush();
+          inCue = false;
+        } else {
+          // Strip inline VTT tags like <i>, <b>, <c>, <00:00:01.000>
+          const cleaned = line.replace(/<[^>]+>/g, '').trim();
+          if (cleaned) current.push(cleaned);
+        }
+      }
+    }
+    flush();
+
+    return cues;
+  }
+
+  function escapeXml(str) {
+    return str
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&apos;');
+  }
+
+  // Build a minimal, valid .docx (OOXML) file from an array of paragraph strings.
+  async function buildDocx(paragraphs) {
+    const zip = new JSZip();
+
+    const contentTypes =
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+<Default Extension="xml" ContentType="application/xml"/>
+<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>
+<Override PartName="/docProps/core.xml" ContentType="application/vnd.openxmlformats-package.core-properties+xml"/>
+<Override PartName="/docProps/app.xml" ContentType="application/vnd.openxmlformats-officedocument.extended-properties+xml"/>
+</Types>`;
+
+    const rels =
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>
+<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/package/2006/relationships/metadata/core-properties" Target="docProps/core.xml"/>
+<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties" Target="docProps/app.xml"/>
+</Relationships>`;
+
+    const coreProps =
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<cp:coreProperties xmlns:cp="http://schemas.openxmlformats.org/package/2006/metadata/core-properties" xmlns:dc="http://purl.org/dc/elements/1.1/">
+<dc:title>Transcript</dc:title>
+<dc:creator>Caption to Transcript Converter</dc:creator>
+</cp:coreProperties>`;
+
+    const appProps =
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties">
+<Application>Caption to Transcript Converter</Application>
+</Properties>`;
+
+    const bodyParagraphs = paragraphs.map(p =>
+      `<w:p><w:r><w:t xml:space="preserve">${escapeXml(p)}</w:t></w:r></w:p>`
+    ).join('');
+
+    const documentXml =
+`<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+<w:body>
+${bodyParagraphs}
+<w:sectPr>
+<w:pgSz w:w="12240" w:h="15840"/>
+<w:pgMar w:top="1440" w:right="1440" w:bottom="1440" w:left="1440" w:header="720" w:footer="720" w:gutter="0"/>
+</w:sectPr>
+</w:body>
+</w:document>`;
+
+    zip.file('[Content_Types].xml', contentTypes);
+    zip.folder('_rels').file('.rels', rels);
+    zip.folder('docProps').file('core.xml', coreProps);
+    zip.file('docProps/app.xml', appProps);
+    zip.folder('word').file('document.xml', documentXml);
+
+    return await zip.generateAsync({
+      type: 'blob',
+      mimeType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    });
+  }
+
+  function deriveFilename(originalName) {
+    const withoutExt = originalName.replace(/\.(srt|vtt)$/i, '');
+    return (withoutExt || 'transcript') + '.docx';
+  }
+
+  form.addEventListener('submit', async function (e) {
+    e.preventDefault();
+    clearError();
+    resultArea.classList.remove('visible');
+
+    const file = fileInput.files[0];
+    if (!file) {
+      showError('Please select an SRT or VTT file first.');
+      return;
+    }
+
+    const nameLower = file.name.toLowerCase();
+    if (!nameLower.endsWith('.srt') && !nameLower.endsWith('.vtt')) {
+      showError('Please select a file with a .srt or .vtt extension.');
+      return;
+    }
+
+    submitBtn.disabled = true;
+    submitBtn.textContent = 'Converting…';
+
+    try {
+      const text = await file.text();
+      const cues = parseCaptions(text);
+
+      if (cues.length === 0) {
+        showError('No caption text could be found in this file. Please check the file format.');
+        return;
+      }
+
+      const blob = await buildDocx(cues);
+      const filename = deriveFilename(file.name);
+
+      if (currentBlobUrl) {
+        URL.revokeObjectURL(currentBlobUrl);
+      }
+      currentBlobUrl = URL.createObjectURL(blob);
+      currentFilename = filename;
+
+      resultFilename.textContent = filename;
+      resultMeta.textContent = cues.length + ' line' + (cues.length === 1 ? '' : 's') + ' of transcript text';
+      resultArea.classList.add('visible');
+    } catch (err) {
+      console.error(err);
+      showError('Something went wrong while converting the file: ' + err.message);
+    } finally {
+      submitBtn.disabled = false;
+      submitBtn.textContent = 'Convert to document transcript';
+    }
+  });
+
+  downloadBtn.addEventListener('click', function () {
+    if (!currentBlobUrl || !currentFilename) return;
+    const a = document.createElement('a');
+    a.href = currentBlobUrl;
+    a.download = currentFilename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+  });
+})();
+</script>
+
+</body>
+</html>
